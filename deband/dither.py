@@ -12,12 +12,12 @@ clock, or any process-global state.  Repeating a call with identical arguments
 must reproduce identical values.  Numeric results are compared with an
 absolute tolerance of ``1e-9``.
 
-``__all__`` lists the eight public primitives.  Every one of them is currently
-a stub and raises ``NotImplementedError``; the contracts below define the
-behaviour the red tests in ``tests/test_dither.py`` expect.
+``__all__`` lists the eight public primitives.
 """
 
 from __future__ import annotations
+
+import math
 
 __all__ = [
     "quantize",
@@ -30,145 +30,185 @@ __all__ = [
     "validate",
 ]
 
+_MASK64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _hash01(seed: int, index: int, stream: int = 0) -> float:
+    """Deterministic uniform in ``[0.0, 1.0)`` from (seed, index, stream).
+
+    Uses the splitmix64 finaliser over a mixed key; no global state, no
+    ``random`` module, fully reproducible across runs and platforms.
+    """
+    z = (
+        (seed & _MASK64) * 0x9E3779B97F4A7C15
+        + (index & _MASK64) * 0xBF58476D1CE4E5B9
+        + (stream & _MASK64) * 0x94D049BB133111EB
+        + 0x2545F4914F6CDD1D
+    ) & _MASK64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+    z = z ^ (z >> 31)
+    return z / 18446744073709551616.0  # 2 ** 64
+
+
+def _check_bits(bits: int) -> None:
+    if isinstance(bits, bool) or not isinstance(bits, int):
+        raise ValueError(f"bits must be an integer in 1..16, got {bits!r}")
+    if bits < 1 or bits > 16:
+        raise ValueError(f"bits must be in 1..16, got {bits}")
+
 
 def quantize(x: float, bits: int) -> float:
-    """Quantise one linear-light sample to ``bits`` bit depth.
-
-    ``x`` is a linear-light float; values outside ``[0.0, 1.0]`` are clipped
-    to the nearest endpoint first.  The sample is rounded to the **nearest**
-    representable level ``k / (2 ** bits - 1)`` (half-way values round up),
-    never truncated with ``floor``: the maximum error is ``0.5 LSB + 1e-9``
-    and the mean error over a uniform sweep is approximately zero (a floor
-    implementation is biased darker by half an LSB).  The returned float lies
-    on the quantisation grid.
-
-    ``bits`` must be an integer in ``1..16``; otherwise raise ``ValueError``.
-    In particular ``bits <= 0`` must be rejected instead of dividing by
-    ``2 ** bits - 1``.
-    """
-    raise NotImplementedError
+    """Quantise one linear-light sample to ``bits`` bit depth (nearest level)."""
+    _check_bits(bits)
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    levels = (1 << bits) - 1
+    k = math.floor(x * levels + 0.5)  # round half up, never floor
+    if k < 0:
+        k = 0
+    elif k > levels:
+        k = levels
+    return k / levels
 
 
 def tpdf_noise(seed: int, n: int) -> list[float]:
-    """Return ``n`` samples of 1-LSB triangular (TPDF) dither noise.
-
-    Samples are floats in ``[-1.0, 1.0]`` measured in LSB: the standard
-    triangular distribution built as the difference of two independent uniform
-    values (peak-to-peak 2 LSB, standard deviation ``1 / sqrt(6) ~ 0.408``).
-    The amplitude is exactly 1 LSB, never 2 LSB.
-
-    The distribution must be triangular, not uniform: samples near zero are
-    much more likely than samples near the extremes.  The mean is close to
-    zero.  ``seed`` and ``n`` are integers with ``n >= 0``.  The output is
-    fully determined by them (same arguments reproduce the same values within
-    ``1e-9``), different seeds select different streams, and no randomness
-    source may be used.
-    """
-    raise NotImplementedError
+    """Return ``n`` samples of 1-LSB triangular (TPDF) dither noise in [-1, 1]."""
+    if n < 0:
+        raise ValueError(f"n must be >= 0, got {n}")
+    out = []
+    for i in range(n):
+        u1 = _hash01(seed, i, 0)
+        u2 = _hash01(seed, i, 1)
+        out.append(u1 - u2)  # triangular on (-1, 1), std 1/sqrt(6), peak 1 LSB
+    return out
 
 
 def blue_noise_1d(seed: int, n: int, strength: float) -> list[float]:
-    """Return ``n`` samples of one-dimensional blue (high-frequency) noise.
+    """Return ``n`` samples of 1-D blue (high-frequency) noise.
 
-    ``strength`` is a scale in ``[0.0, 1.0]``; every sample lies in
-    ``[-strength, strength]`` and the peak approaches ``strength``.  Adjacent
-    samples are **negatively correlated**: the normalised lag-1
-    autocorrelation is ``r1 <= -0.25``.  White noise, whose ``r1`` is about
-    zero, is not blue noise.  The mean is close to zero.
-
-    The result is deterministic in ``(seed, n, strength)`` within ``1e-9``,
-    different seeds select different streams, and no randomness source may be
-    used.
+    Built as the first difference of white noise, which gives a lag-1
+    autocorrelation of -0.5 and a peak approaching ``strength``.
     """
-    raise NotImplementedError
+    if n < 0:
+        raise ValueError(f"n must be >= 0, got {n}")
+    white = [_hash01(seed, i, 2) * 2.0 - 1.0 for i in range(n + 1)]
+    return [
+        strength * 0.5 * (white[i + 1] - white[i]) for i in range(n)
+    ]
 
 
 def apply_dither(img: list[float], bits: int, strength: float, seed: int) -> list[float]:
-    """Add dither noise and only then quantise, returning a float image.
-
-    ``img`` is a flat sequence of linear-light samples in ``[0.0, 1.0]`` and
-    ``bits`` is the target bit depth (``1..16``).  ``strength`` is expressed
-    in LSB; ``1.0`` means ``+/-1`` LSB of TPDF noise.
-
-    The order is mandatory: add noise **before** rounding to the
-    ``1 / (2 ** bits - 1)`` grid.  Every output sample is therefore exactly on
-    the quantisation grid (within ``1e-9``) and inside ``[0.0, 1.0]``.  Dither
-    must genuinely break flat bands (``band_variance`` rises above the
-    undithered value) while the mean absolute error stays below 1 LSB.
-
-    The noise is derived from ``seed``: different seeds must produce different
-    grain, so a static shot crawls from frame to frame, while the same seed
-    reproduces the same result within ``1e-9``.  A fixed internal seed is not
-    acceptable.  ``bits < 1`` raises ``ValueError``.
-    """
-    raise NotImplementedError
+    """Add TPDF dither noise and only then quantise, returning a float image."""
+    _check_bits(bits)
+    lsb = 1.0 / ((1 << bits) - 1)
+    noise = tpdf_noise(seed, len(img))
+    amp = strength * lsb
+    return [quantize(x + amp * noise[i], bits) for i, x in enumerate(img)]
 
 
 def deband_gradient(img: list[float], steps: int) -> list[float]:
-    """Simulate hard colour banding by quantising to ``steps`` levels.
-
-    ``steps`` is the **number of discrete levels** in ``[0.0, 1.0]`` (an
-    integer ``>= 2``), not a bit depth and not an exponent: the levels are
-    ``k / (steps - 1)``, so a ramp spanning the full range yields exactly
-    ``steps`` distinct output values.  Using ``2 ** steps`` levels is the
-    classic bug that over-simulates banding.
-
-    Samples are rounded to the nearest level, clipped to ``[0.0, 1.0]`` and
-    returned as floats (tolerance ``1e-9``).  ``steps < 2`` raises
-    ``ValueError``.
-    """
-    raise NotImplementedError
+    """Simulate hard colour banding by quantising to ``steps`` plain levels."""
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 2:
+        raise ValueError(f"steps must be an integer >= 2, got {steps!r}")
+    levels = steps - 1
+    out = []
+    for x in img:
+        if x <= 0.0:
+            out.append(0.0)
+        elif x >= 1.0:
+            out.append(1.0)
+        else:
+            out.append(math.floor(x * levels + 0.5) / levels)
+    return out
 
 
 def band_variance(img: list[float]) -> float:
-    """Estimate the within-band variance of a flat linear-light image.
-
-    The image is high-passed with a three-tap median: for every interior
-    sample compute ``d = img[i] - median(img[i-1], img[i], img[i+1])`` and
-    return ``mean(d * d)``.  The median makes the measure insensitive to step
-    edges, ramps and static content, so it does **not** degrade into the
-    whole-image variance, which is dominated by edges and ramps and reports
-    bogus values.
-
-    Hard, undithered bands (flat plateaus, clean steps) give ``0.0`` within
-    ``1e-9``; a dithered flat region gives a clearly positive value.
-    ``len(img) < 3`` returns ``0.0``.  The function is deterministic.
-    """
-    raise NotImplementedError
+    """Within-band variance via a three-tap median high-pass."""
+    n = len(img)
+    if n < 3:
+        return 0.0
+    total = 0.0
+    count = 0
+    for i in range(1, n - 1):
+        a, b, c = img[i - 1], img[i], img[i + 1]
+        med = a + b + c - min(a, b, c) - max(a, b, c)
+        d = b - med
+        total += d * d
+        count += 1
+    return total / count
 
 
 def temporal_stability(frames: list[list[float]], seed: int) -> float:
-    """Measure how static the grain is across frames, in ``[0.0, 1.0]``.
+    """Correlation of temporal noise across frames, clipped to [0.0, 1.0]."""
+    if len(frames) < 2:
+        raise ValueError("need at least two frames")
+    n = len(frames[0])
+    for frame in frames:
+        if len(frame) != n:
+            raise ValueError("all frames must have equal length")
+    if n == 0:
+        return 1.0
 
-    ``frames`` holds at least two equal-length float frames (typically dithered
-    ``[0.0, 1.0]`` images; any finite floats are accepted).  The per-pixel
-    temporal mean is subtracted first, so static scene content (ramps, edges)
-    cancels and only temporal noise remains; skipping this step lets shared
-    content dominate and drives the result to 1.
+    # Deterministic subsampling offset selected by the seed.
+    start = seed % n
+    idx = range(start, n)
+    count = n - start
 
-    The normalised correlation of adjacent residual pairs is averaged and
-    clipped to ``[0.0, 1.0]`` (negative correlation becomes 0).  Frames that
-    are all identical have zero residual and return ``1.0``; independent
-    per-frame grain returns about ``0.0``.
+    # Per-pixel temporal mean, so static scene content cancels.
+    means = [0.0] * count
+    for frame in frames:
+        for j, i in enumerate(idx):
+            means[j] += frame[i]
+    inv = 1.0 / len(frames)
+    means = [m * inv for m in means]
 
-    ``seed`` only selects a deterministic subsampling offset; no randomness is
-    allowed.  Values are compared with tolerance ``1e-9``.  Mismatched frame
-    lengths or fewer than two frames raise ``ValueError``.
-    """
-    raise NotImplementedError
+    residuals = [
+        [frame[i] - means[j] for j, i in enumerate(idx)] for frame in frames
+    ]
+
+    corrs = []
+    for f in range(len(frames) - 1):
+        a = residuals[f]
+        b = residuals[f + 1]
+        mean_a = sum(a) / count
+        mean_b = sum(b) / count
+        var_a = sum((v - mean_a) ** 2 for v in a)
+        var_b = sum((v - mean_b) ** 2 for v in b)
+        if var_a <= 0.0 and var_b <= 0.0:
+            corrs.append(1.0)  # no temporal noise at all: perfectly stable
+        elif var_a <= 0.0 or var_b <= 0.0:
+            corrs.append(0.0)
+        else:
+            cov = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b))
+            corrs.append(cov / math.sqrt(var_a * var_b))
+
+    result = sum(corrs) / len(corrs)
+    return min(1.0, max(0.0, result))
 
 
 def validate(img: list[float], bits: int) -> list[str]:
-    """Return a list of human-readable problems; ``[]`` means valid.
+    """Return a list of human-readable problems; ``[]`` means valid."""
+    problems: list[str] = []
 
-    ``img`` must be a non-empty flat sequence of at most ``2 ** 22`` finite
-    linear-light samples, each in ``[0.0, 1.0]`` within ``1e-9``.  ``bits``
-    must be an integer in ``1..16``.  ``bits <= 0``, ``bits > 16``,
-    non-integer bits, an empty image, an oversized image, a non-finite sample,
-    or an out-of-range sample each add one string.
+    # Check bits before anything that could divide by 2 ** bits - 1.
+    if isinstance(bits, bool) or not isinstance(bits, int):
+        problems.append(f"bits must be an integer, got {bits!r}")
+    elif bits < 1:
+        problems.append(f"bits must be >= 1, got {bits}")
+    elif bits > 16:
+        problems.append(f"bits must be <= 16, got {bits}")
 
-    Problems are reported as strings instead of raised, and the helper must
-    never divide by ``2 ** bits - 1`` before checking ``bits``: ``bits == 0``
-    would otherwise be a zero-division crash.
-    """
-    raise NotImplementedError
+    if len(img) == 0:
+        problems.append("image is empty")
+    elif len(img) > 2 ** 22:
+        problems.append(f"image too large: {len(img)} samples > 2 ** 22")
+
+    if any(not math.isfinite(v) for v in img):
+        problems.append("image contains a non-finite sample")
+    if any(v < -1e-9 or v > 1.0 + 1e-9 for v in img):
+        problems.append("image contains a sample outside [0.0, 1.0]")
+
+    return problems
